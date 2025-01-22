@@ -31,6 +31,7 @@ from torch.utils.checkpoint import (
     CheckpointPolicy,
 )
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.distributed_c10d import Backend
 
 # for no recompute ops
 import xformers.ops
@@ -47,7 +48,7 @@ default_no_recompute_ops = {
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops.c10d_functional.reduce_scatter_tensor.default,
     torch.ops.xformers_flash.flash_fwd.default,
-    torch.ops.xformers.efficient_attention_forward_cutlass.default,
+    #torch.ops.xformers.efficient_attention_forward_cutlass.default,
 }
 
 
@@ -274,7 +275,7 @@ def setup_torch_distributed(dist_args):
     )
     if torch.cuda.device_count() > 1:
         torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(init_method="env://", backend="nccl")
+    torch.distributed.init_process_group(init_method="tcp://127.0.0.1:29500?use_libuv=0", backend="gloo", rank=get_global_rank(), world_size=get_world_size())
     torch.autograd.set_detect_anomaly(dist_args.detect_anomaly)
 
 
@@ -342,8 +343,11 @@ def init_signal_handler(callable):
     """
     Handle signals sent by SLURM for time limit / pre-emption.
     """
-    signal.signal(signal.SIGUSR2, callable)
-    logger.warning("Signal handler installed.")
+    try:
+        signal.signal(signal.SIGUSR2, callable)
+        logger.warning("Signal handler installed.")
+    except Exception as e:
+        logger.warning(f"Failed to install signal handler: {e}")
 
 
 def requeue_slurm_job():

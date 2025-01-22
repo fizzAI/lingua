@@ -137,7 +137,8 @@ def validate_train_args(args: TrainArgs, output_size: int):
     assert args.dump_dir, "Dump dir not set"
 
     if args.checkpoint.path is None:
-        logger.info(f"Setting checkpoint path to {str(Path(args.dump_dir) / "checkpoints")}")
+        #logger.info(f"Setting checkpoint path to {str(Path(args.dump_dir) / "checkpoints")}")
+        logger.info(f"Setting checkpoint path to {args.dump_dir}/checkpoints")
         args.checkpoint.path = str(Path(args.dump_dir) / "checkpoints")
 
     for source in args.data.sources:
@@ -507,7 +508,7 @@ def train(args: TrainArgs):
 
                 to_sync = {}
                 to_sync["loss/out"] = loss.item()
-                metrics.update(dist_mean_dict(to_sync))
+                #metrics.update(dist_mean_dict(to_sync))
 
                 if get_is_master():
                     metric_logger.log(metrics)

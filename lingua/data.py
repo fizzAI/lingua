@@ -170,7 +170,7 @@ def read_jsonl(
         offset=offset,
         current_iter=current_iter,
     )
-    with open(file_path, "r") as file:
+    with open(file_path, "r", encoding="utf-8") as file:
         file.seek(position)
         while line := file.readline():
             current_line += 1
