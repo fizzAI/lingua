@@ -6,6 +6,7 @@ import time
 import subprocess
 import requests
 from huggingface_hub import snapshot_download
+from tqdm import tqdm
 
 def run_command(command):
     print(f"Running: {command}")
@@ -36,7 +37,7 @@ def download_dataset(repo_id, local_dir, allow_patterns):
     print(f"Dataset downloaded to {local_dir}")
 
 
-def parquet_to_jsonl(dataset, work_dir, src_dir, tgt_dir, ntasks=64):
+def parquet_to_jsonl(dataset, work_dir, src_dir, tgt_dir, ntasks=32):
     from datatrove.executor import LocalPipelineExecutor
     from datatrove.pipeline.readers import ParquetReader
     from datatrove.pipeline.writers import JsonlWriter
@@ -57,6 +58,7 @@ def parquet_to_jsonl(dataset, work_dir, src_dir, tgt_dir, ntasks=64):
         ],
         tasks=ntasks,
         logging_dir=os.path.join(work_dir, "datatrove"),
+        start_method="spawn",
     )
     pipeline_exec.run()
 
@@ -75,13 +77,14 @@ def setup_terashuf(work_dir):
     return terashuf_dir
 
 
-def main(dataset, memory, data_dir, seed=42, nchunks=32):
+def main(dataset, memory, data_dir, seed=42, nchunks=32, skipdl=False, skipchunking=False):
     # Configuration
     repo_id = {
         "fineweb_edu": "HuggingFaceFW/fineweb-edu",
         "fineweb_edu_10bt": "HuggingFaceFW/fineweb-edu",
         "dclm_baseline_1.0": "mlfoundations/dclm-baseline-1.0",
         "dclm_baseline_1.0_10prct": "mlfoundations/dclm-baseline-1.0",
+        "minipile": "JeanKaddour/minipile"
     }[dataset]
     src_dir = f"{data_dir}/{dataset}"
     out_dir = f"{src_dir}_shuffled"
@@ -93,50 +96,70 @@ def main(dataset, memory, data_dir, seed=42, nchunks=32):
         "fineweb_edu_10bt": ".jsonl",
         "dclm_baseline_1.0": ".jsonl.zst",
         "dclm_baseline_1.0_10prct": ".jsonl.zst",
+        "minipile": ".jsonl"
     }[dataset]
     cat_command = {
         "fineweb_edu": "cat",
         "fineweb_edu_10bt": "cat",
         "dclm_baseline_1.0": "zstdcat",
         "dclm_baseline_1.0_10prct": "zstdcat",
+        "minipile": "cat"
     }[dataset]
     allow_patterns = {
         "fineweb_edu": None,
         "fineweb_edu_10bt": "sample/10BT/*",
         "dclm_baseline_1.0": "*.jsonl.zst",
         "dclm_baseline_1.0_10prct": "global-shard_01_of_10/*.jsonl.zst",
+        "minipile": None
     }[dataset]
     suffix = ".jsonl"
     k_validation = 10000  # Number of lines to take from each chunk for validation
 
-    # Setup terashuf
-    terashuf_dir = setup_terashuf(work_dir)
+    if not skipdl:
+        # Download dataset
+        download_dataset(repo_id, src_dir, allow_patterns)
 
-    # Download dataset
-    download_dataset(repo_id, src_dir, allow_patterns)
-
-    if "fineweb" in dataset:
-        parquet_to_jsonl(dataset, work_dir, src_dir, src_dir)
+        if "fineweb" in dataset or "minipile" in dataset:
+            parquet_to_jsonl(dataset, work_dir, src_dir, src_dir)
 
     # Set up environment variables
     os.environ["MEMORY"] = f"{memory}"
     os.environ["SEED"] = f"{seed}"
 
-    # Run the original shuffling and splitting command
-    terashuf_executable = os.path.join(terashuf_dir, "terashuf")
-    run_command(
-        f"ulimit -n 100000 && "
-        f"find {src_dir} -type f -name '*{orig_extension}' -print0 | xargs -0 {cat_command} | {terashuf_executable} | "
-        f"split -n r/{nchunks} -d --suffix-length 2 --additional-suffix {suffix} - {out_dir}/{prefix}"
-        "; trap 'echo \"Caught signal 13, exiting with code 1\"; exit 1' SIGPIPE;"
-    )
+    # Run the shuffling and splitting using Python since Windows doesn't have Unix tools
+    import glob
+    import random
+    from pathlib import Path
+    
+    # Get all files matching pattern
+    files = glob.glob(str(Path(src_dir) / f'*{orig_extension}'))
+    
+    if not skipchunking:
+        # Read and shuffle all lines
+        all_lines = []
+        for file in tqdm(files, desc="Reading files"):
+            with open(file, 'r', encoding='utf-8') as f:
+                all_lines.extend(f.readlines())
+        
+        random.shuffle(all_lines)
+        
+        # Split into chunks
+        chunk_size = len(all_lines) // nchunks
+        chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
+        
+        # Write chunks to files
+        for i, chunk in enumerate(tqdm(chunks, desc="Writing chunks")):
+            out_file = Path(out_dir) / f'{prefix}{i:02d}{suffix}'
+            with open(out_file, 'w', encoding='utf-8') as f:
+                f.writelines(chunk)
 
     # Create validation set and remove lines from chunks
     validation_file = f"{out_dir}/{dataset}.val{suffix}"
-    for i in range(nchunks):
+    for i in tqdm(range(nchunks), desc="Creating validation set"):
         chunk_file = f"{out_dir}/{prefix}{i:02d}{suffix}"
-        run_command(f"head -n {k_validation} {chunk_file} >> {validation_file}")
-        run_command(f"sed -i '1,{k_validation}d' {chunk_file}")
+        run_command(f"head -n {k_validation} {chunk_file} > {validation_file}")
+        # Read all lines after k_validation
+        run_command(f"tail -n +{k_validation + 1} {chunk_file} > {chunk_file}.tmp && mv {chunk_file}.tmp {chunk_file}")
 
     print("All tasks completed successfully!")
 
@@ -148,7 +171,9 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nchunks", type=int, default=32)
+    parser.add_argument("--skipdl", action="store_true")
+    parser.add_argument("--skipchunking", action="store_true")
 
     args = parser.parse_args()
 
-    main(args.dataset, args.memory, args.data_dir, args.seed, args.nchunks)
+    main(args.dataset, args.memory, args.data_dir, args.seed, args.nchunks, args.skipdl, args.skipchunking)
